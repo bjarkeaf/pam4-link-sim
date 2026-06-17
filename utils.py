@@ -143,6 +143,65 @@ def upsample(symbol_sequence, samples_per_ui):
     """
     return np.repeat(symbol_sequence, samples_per_ui).astype(float)
 
+def fiber_loss_db(distance_m, attenuation_db_per_km=0.5, connection_loss_db=2.75):
+    """Returns total fiber channel insertion loss in dB (IEEE 802.3 121.11).
+
+    Args:
+        distance_m (float): Fiber length in meters.
+        attenuation_db_per_km (float): Fiber attenuation in dB/km (max 0.5 per Table 121-14).
+        connection_loss_db (float): Total connector + splice loss in dB (2.75 dB allocation per 121.11.2.1).
+
+    Returns:
+        float: Total insertion loss in dB. Max 3.0 dB at 500m for 200GBASE-DR4.
+    """
+    return attenuation_db_per_km * distance_m / 1000 + connection_loss_db
+
+def fiber_dispersion_ps_per_nm(distance_m, wavelength_nm=1310.0, lambda0_nm=1300.0, S0_ps_per_nm2_per_km=0.093):
+    """Returns total chromatic dispersion D*L in ps/nm for a SMF link (IEC 60793-2-50 formula).
+
+    Args:
+        distance_m (float): Fiber length in meters.
+        wavelength_nm (float): Laser wavelength in nm (default 1310).
+        lambda0_nm (float): Zero-dispersion wavelength in nm (1300-1324 per Table 121-14; use 1300 for worst case).
+        S0_ps_per_nm2_per_km (float): Dispersion slope in ps/nm²/km (max 0.093 per Table 121-14).
+
+    Returns:
+        float: Total dispersion D*L in ps/nm. Bounded by -0.93 to +0.8 ps/nm for 200GBASE-DR4 (Table 121-13).
+    """
+    D = (S0_ps_per_nm2_per_km / 4) * (wavelength_nm - lambda0_nm**4 / wavelength_nm**3)
+    return D * distance_m / 1000
+
+def channel_filter(waveform, samples_per_ui, ui, loss_db=0.0, dispersion_ps_per_nm=0.0, wavelength_nm=1310.0):
+    """Applies fiber channel: flat attenuation and chromatic dispersion.
+
+    Args:
+        waveform (np.ndarray): TX waveform at N samples/UI.
+        samples_per_ui (int): Oversampling factor N.
+        ui (float): Symbol period in seconds (= 1 / symbol_rate).
+        loss_db (float): Total channel insertion loss in dB (0-3 dB for 200GBASE-DR4).
+        dispersion_ps_per_nm (float): Total chromatic dispersion D*L in ps/nm (-0.93 to +0.8 for 200GBASE-DR4).
+        wavelength_nm (float): Laser center wavelength in nm (default 1310).
+
+    Returns:
+        np.ndarray: Waveform after channel, same shape as input.
+    """
+    # Attenuation: scale all power levels equally, ER unchanged
+    out = waveform * 10 ** (-loss_db / 10)
+
+    # Chromatic dispersion: quadratic phase in frequency domain
+    # H(f) = exp(+j * pi * D_total * lambda^2 / c * f^2), Agrawal sign convention
+    if dispersion_ps_per_nm != 0.0:
+        n = len(out)
+        dt = ui / samples_per_ui
+        f = np.fft.fftfreq(n, d=dt)                          # baseband frequencies in Hz
+        D_total = dispersion_ps_per_nm * 1e-12 / 1e-9        # convert ps/nm to s/m
+        lam = wavelength_nm * 1e-9                           # m
+        c = 3e8                                               # m/s
+        H = np.exp(1j * np.pi * D_total * lam**2 / c * f**2)
+        out = np.fft.ifft(np.fft.fft(out) * H).real
+
+    return out
+
 def tx_filter(waveform, samples_per_ui, transition_time, ui):
     """Applies a single-pole low-pass filter modelling finite TX bandwidth.
 
@@ -187,22 +246,24 @@ transition_time = 10e-12
 n_symbols = 50
 
 power = test_patterns[0]
-upsampled = upsample(power[:n_symbols], samples_per_ui)
-waveform = tx_filter(upsampled, samples_per_ui, transition_time, ui)
+upsampled = upsample(power, samples_per_ui)
+tx = tx_filter(upsampled, samples_per_ui, transition_time, ui)
+loss_db_plot, disp_plot = fiber_loss_db(500), fiber_dispersion_ps_per_nm(500)
+rx = channel_filter(tx, samples_per_ui, ui, loss_db=loss_db_plot, dispersion_ps_per_nm=disp_plot)
 t = np.arange(n_symbols * samples_per_ui) * (ui / samples_per_ui) * 1e12  # ps
-
 power_levels = [0.333, 0.667, 1.0, 1.333]
 fig, ax = plt.subplots(figsize=(12, 4))
-ax.plot(t, upsampled, lw=0.8, label='Before filter (rectangular)')
-ax.plot(t, waveform, lw=0.8, label=f'After filter ({transition_time*1e12:.0f} ps transition time)')
+ax.plot(t, upsampled[:n_symbols * samples_per_ui], lw=0.8, label='Original (rectangular)')
+ax.plot(t, tx[:n_symbols * samples_per_ui], lw=0.8, label=f'After TX filter ({transition_time*1e12:.0f} ps transition time)')
+ax.plot(t, rx[:n_symbols * samples_per_ui], lw=0.8, label=f'After channel ({loss_db_plot} dB loss, {disp_plot} ps/nm dispersion)')
 for p, label in zip(power_levels, ['P0', 'P1', 'P2', 'P3']):
     ax.axhline(p, color='red', lw=0.5, ls='--', alpha=0.5, label=label)
 ax.set_xlabel('Time (ps)')
 ax.set_ylabel('Power (mW)')
-ax.set_title('TX waveform, first 50 symbols, PRBS13Q lane 0')
+ax.set_title('TX vs RX waveform, first 50 symbols, PRBS13Q lane 0')
 ax.legend(loc='upper right', fontsize=8)
 plt.tight_layout()
-plt.savefig('tx_waveform.png', dpi=150)
+plt.savefig('waveforms.png', dpi=150)
 plt.show()
 
 # %%
