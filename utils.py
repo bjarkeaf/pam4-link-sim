@@ -1,7 +1,7 @@
 #%% Imports
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.signal import lfilter
+from scipy.signal import lfilter, bessel
 
 #%% Utility functions for LFSR and PRBS generation
 
@@ -132,28 +132,11 @@ def power_level_statistics(power_levels):
     }
 
 def upsample(symbol_sequence, samples_per_ui):
-    """Repeats each symbol sample_per_ui times to go from 1 sample/symbol to N samples/UI.
-
-    Args:
-        symbol_sequence (list or array): One value per symbol (e.g. from symbol_to_power).
-        samples_per_ui (int): Oversampling factor N.
-
-    Returns:
-        np.ndarray: Rectangular waveform at N samples/UI.
-    """
+    """Repeats each symbol sample_per_ui times to go from 1 sample/symbol to N samples/UI."""
     return np.repeat(symbol_sequence, samples_per_ui).astype(float)
 
 def fiber_loss_db(distance_m, attenuation_db_per_km=0.5, connection_loss_db=2.75):
-    """Returns total fiber channel insertion loss in dB (IEEE 802.3 121.11).
-
-    Args:
-        distance_m (float): Fiber length in meters.
-        attenuation_db_per_km (float): Fiber attenuation in dB/km (max 0.5 per Table 121-14).
-        connection_loss_db (float): Total connector + splice loss in dB (2.75 dB allocation per 121.11.2.1).
-
-    Returns:
-        float: Total insertion loss in dB. Max 3.0 dB at 500m for 200GBASE-DR4.
-    """
+    """Returns total fiber channel insertion loss in dB for a given distance, using a flat attenuation model."""
     return attenuation_db_per_km * distance_m / 1000 + connection_loss_db
 
 def fiber_dispersion_ps_per_nm(distance_m, wavelength_nm=1310.0, lambda0_nm=1300.0, S0_ps_per_nm2_per_km=0.093):
@@ -221,7 +204,73 @@ def tx_filter(waveform, samples_per_ui, transition_time, ui):
     a = [1, -(1 - alpha)]               # lfilter subtracts a[1]*y[n-1], so a[1] is negated
     return lfilter(b, a, waveform)
 
+def rx_filter(waveform, samples_per_ui, symbol_rate, order=4, f3db_hz=None):
+    """Applies a Bessel-Thomson low-pass filter modeling the O/E converter and oscilloscope.
+
+    Args:
+        waveform (np.ndarray): Input waveform at N samples/UI.
+        samples_per_ui (int): Oversampling factor N.
+        symbol_rate (float): Symbol rate in Hz (e.g. 26.5625e9).
+        order (int): Filter order (4 per IEEE 802.3-2022 121.8.5.1).
+        f3db_hz (float): 3 dB bandwidth in Hz. Defaults to 0.5 * symbol_rate (~13.28125 GHz).
+
+    Returns:
+        np.ndarray: Filtered waveform, same shape as input.
+    """
+    if f3db_hz is None:
+        f3db_hz = 0.5 * symbol_rate
+    fs = symbol_rate * samples_per_ui
+    b, a = bessel(order, f3db_hz, btype='low', analog=False, norm='mag', fs=fs)
+    return lfilter(b, a, waveform)
+
+def ffe(waveform, samples_per_ui, n_taps=5, tap_weights=None, sample_offset=None):
+    """Applies a T-spaced feed-forward equalizer (FFE) per IEEE 802.3-2022 121.8.5.4.
+
+    Downsamples to symbol rate at sample_offset, then applies a weighted sum over n_taps
+    consecutive symbol-spaced samples. Default tap initialization places all weight on the
+    center tap (identity: no equalization).
+
+    Args:
+        waveform (np.ndarray): Input waveform at N samples/UI (e.g. after rx_filter).
+        samples_per_ui (int): Oversampling factor N.
+        n_taps (int): Number of equalizer taps (5 per 121.8.5.4).
+        tap_weights (array-like or None): Tap coefficients. None defaults to center-tap init.
+        sample_offset (int or None): Sample index within each UI to use for downsampling.
+                                     None defaults to samples_per_ui // 2 (center of UI).
+
+    Returns:
+        equalized (np.ndarray): Equalized symbol values, length len(sampled) - n_taps + 1.
+        tap_weights (np.ndarray): The tap coefficients used.
+    """
+    if sample_offset is None:
+        sample_offset = samples_per_ui // 2
+    if tap_weights is None:
+        tap_weights = np.zeros(n_taps)
+        tap_weights[n_taps // 2] = 1.0
+    else:
+        tap_weights = np.asarray(tap_weights, dtype=float)
+
+    sampled = waveform[sample_offset::samples_per_ui]
+    n_out = len(sampled) - n_taps + 1
+    equalized = np.array([np.dot(tap_weights, sampled[i:i + n_taps]) for i in range(n_out)])
+    return equalized, tap_weights
+
+def rx_threshold(samples, rx_power_levels):
+    """Converts sampled values to PAM4 symbol decisions (0-3) using midpoint thresholds.
+
+    Args:
+        samples (array-like): Sampled values at symbol rate (e.g. FFE output).
+        rx_power_levels (list of float): Four received power levels [R0, R1, R2, R3].
+
+    Returns:
+        np.ndarray: Symbol decisions in {0, 1, 2, 3}.
+    """
+    R0, R1, R2, R3 = rx_power_levels
+    thresholds = [(R0 + R1) / 2, (R1 + R2) / 2, (R2 + R3) / 2]
+    return np.digitize(np.asarray(samples), thresholds)
+
 #%% Function testing
+
 
 # Generating test patterns for lanes 0-3
 seeds = [0b0000010101011, 0b0011101000001, 0b1001000101100, 0b0100010000010]  # Different seeds for each lane
@@ -230,40 +279,104 @@ for seed in seeds:
     prbs_bits = prbs_sequence(register_size=13, seed=seed)  # Generate full PRBS-13 sequence (8191 bits)
     prbs_bits += prbs_bits  # Duplicate the sequence to ensure even length for pairing
     gray_pairs = gray_code_pairs(prbs_bits)  # Pair and Gray-code the bits
-    power_symbols = symbol_to_power(gray_pairs)  # Convert to PAM4 power levels (mW)
-    test_patterns.append(power_symbols)
+    test_patterns.append(gray_pairs)
 
 print("Generated PAM4 test patterns for lanes 0-3 (first 20 symbols of each lane):")
 for lane, pattern in enumerate(test_patterns):
     print(f"Lane {lane}: {pattern[:20]}")
 
-# %% 
+#%% Example usage: simulate the TX to RX pipeline for a single lane, first n_symbols symbols
 
-symbol_rate = 26.5625e9
+symbol_rate = 26.5625e9 # 26.5625 GBd for 200GBASE-DR4
 ui = 1 / symbol_rate
 samples_per_ui = 16
 transition_time = 10e-12
 n_symbols = 50
+tx_power_levels = [0.333, 0.667, 1.0, 1.333]
+n_taps = 5
+lane = 3
 
-power = test_patterns[0]
+tx_pattern = test_patterns[lane][:n_symbols + n_taps + 3]
+power = symbol_to_power(tx_pattern)
 upsampled = upsample(power, samples_per_ui)
 tx = tx_filter(upsampled, samples_per_ui, transition_time, ui)
-loss_db_plot, disp_plot = fiber_loss_db(500), fiber_dispersion_ps_per_nm(500)
-rx = channel_filter(tx, samples_per_ui, ui, loss_db=loss_db_plot, dispersion_ps_per_nm=disp_plot)
+loss_db, disp = fiber_loss_db(500), fiber_dispersion_ps_per_nm(500)
+rx = channel_filter(tx, samples_per_ui, ui, loss_db=loss_db, dispersion_ps_per_nm=disp)
+oe = rx_filter(rx, samples_per_ui, symbol_rate)
+ffe_out, tap_w = ffe(oe, samples_per_ui, n_taps)
+
 t = np.arange(n_symbols * samples_per_ui) * (ui / samples_per_ui) * 1e12  # ps
-power_levels = [0.333, 0.667, 1.0, 1.333]
-fig, ax = plt.subplots(figsize=(12, 4))
-ax.plot(t, upsampled[:n_symbols * samples_per_ui], lw=0.8, label='Original (rectangular)')
-ax.plot(t, tx[:n_symbols * samples_per_ui], lw=0.8, label=f'After TX filter ({transition_time*1e12:.0f} ps transition time)')
-ax.plot(t, rx[:n_symbols * samples_per_ui], lw=0.8, label=f'After channel ({loss_db_plot} dB loss, {disp_plot} ps/nm dispersion)')
-for p, label in zip(power_levels, ['P0', 'P1', 'P2', 'P3']):
-    ax.axhline(p, color='red', lw=0.5, ls='--', alpha=0.5, label=label)
-ax.set_xlabel('Time (ps)')
-ax.set_ylabel('Power (mW)')
-ax.set_title('TX vs RX waveform, first 50 symbols, PRBS13Q lane 0')
-ax.legend(loc='upper right', fontsize=8)
+n_plot = n_symbols * samples_per_ui
+ui_ps = ui * 1e12
+
+rx_power_levels = [p * 10 ** (-loss_db / 10) for p in tx_power_levels]
+
+n_ffe_plot = min(len(ffe_out), n_symbols - n_taps + 1) # Number of FFE output points to plot
+rx_decisions = rx_threshold(ffe_out[:n_ffe_plot], rx_power_levels)
+
+# Align the FFE output with the transmitted symbols by finding the offset that minimizes symbol errors
+
+tx_syms = np.array(tx_pattern)
+
+cursor = min(range(n_taps + 3),
+             key=lambda d: np.sum(rx_decisions != tx_syms[d:d + n_ffe_plot]))
+
+t_ffe = np.array([(i + cursor + 0.5) * ui_ps for i in range(n_ffe_plot)])
+tx_syms_aligned = tx_syms[cursor:cursor + n_ffe_plot]
+errors = np.where(rx_decisions != tx_syms_aligned)[0]
+t_sym_tx = np.arange(n_symbols) * ui_ps
+t_sym_rx = np.arange(n_ffe_plot) * ui_ps + cursor * ui_ps
+
+# Set up a 3-panel plot: TX waveforms, RX waveforms, and TX vs RX symbol decisions
+
+fig, axes = plt.subplots(3, 1, figsize=(14, 9), sharex=True,
+                         gridspec_kw={'height_ratios': [2, 2, 1]})
+
+for ax in axes:
+    for k in range(n_symbols):
+        if k % 2 == 0:
+            ax.axvspan(k * ui_ps, (k + 1) * ui_ps, color='gray', alpha=0.15, lw=0)
+
+# Panel 1: TX waveforms
+ax1 = axes[0]
+ax1.plot(t, upsampled[:n_plot], lw=0.8, label='Rectangular')
+ax1.plot(t, tx[:n_plot], lw=0.8, label=f'After TX filter ({transition_time*1e12:.0f} ps rise time)')
+for i, p in enumerate(tx_power_levels):
+    ax1.axhline(p, color='red', lw=0.5, ls='--', alpha=0.5,
+                label='TX power levels' if i == 0 else '_nolegend_')
+ax1.set_ylabel('Power (mW)')
+ax1.set_title('TX waveforms')
+ax1.legend(loc='upper right', fontsize=8)
+
+# Panel 2: RX waveforms
+ax2 = axes[1]
+ax2.plot(t, rx[:n_plot], lw=0.8, label=f'After channel ({loss_db:.2f} dB, {disp:.3f} ps/nm)')
+ax2.plot(t, oe[:n_plot], lw=0.8, label='After RX filter (Bessel-Thomson)')
+ax2.scatter(t_ffe, ffe_out[:n_ffe_plot], s=12, zorder=5, label='After FFE (center tap)')
+for i, p in enumerate(rx_power_levels):
+    ax2.axhline(p, color='blue', lw=0.5, ls='--', alpha=0.5,
+                label='RX power levels' if i == 0 else '_nolegend_')
+ax2.set_ylabel('Power (mW)')
+ax2.set_title('RX waveforms')
+ax2.legend(loc='upper right', fontsize=8)
+
+# Panel 3: TX vs RX symbols
+ax3 = axes[2]
+ax3.step(t_sym_tx, tx_syms[:n_symbols], where='post', lw=1.2, label='TX symbols')
+ax3.step(t_sym_rx, rx_decisions, where='post', lw=1.2, ls='--', label='RX decisions')
+if len(errors) > 0:
+    t_err = t_sym_rx[errors] + 0.5 * ui_ps
+    ax3.scatter(t_err, rx_decisions[errors], marker='x', color='red', s=40, zorder=5,
+                label=f'Errors ({len(errors)})')
+ax3.set_yticks([0, 1, 2, 3])
+ax3.set_ylabel('Symbol')
+ax3.set_xlabel('Time (ps)')
+ax3.set_title('TX vs RX symbol decisions')
+ax3.legend(loc='upper right', fontsize=8)
+
 plt.tight_layout()
 plt.savefig('waveforms.png', dpi=150)
 plt.show()
 
 # %%
+
