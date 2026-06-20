@@ -1,4 +1,3 @@
-#%% Imports
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import lfilter, bessel, freqz
@@ -67,7 +66,7 @@ def prbs_sequence(register_size, seed, num_bits=None, taps=None):
     # Use provided taps or default to standard PRBS if available
     if taps is None:
         taps = standard_taps.get(register_size, [])
-    
+
     return lfsr_sequence(register_size=register_size, taps=taps, seed=seed, num_bits=num_bits)
 
 def gray_code_pairs(bit_sequence):
@@ -83,7 +82,7 @@ def gray_code_pairs(bit_sequence):
 
 # def precode(data_sequence, block_size=46):
 #     # Not needed for test patterns, only for training pattern, but left for future use.
-#     """Precodes a sequence of integer symbols (0-3) per IEEE 802.3 94.2.2.6, by subtracting 
+#     """Precodes a sequence of integer symbols (0-3) per IEEE 802.3 94.2.2.6, by subtracting
 #     the previous precoded symbol from the current data symbol modulo 4. First symbol of each
 #     block of size block_size is passed through unchanged."""
 #     if not data_sequence:
@@ -143,20 +142,6 @@ def fiber_loss_db(distance_m, attenuation_db_per_km=0.5, connection_loss_db=2.75
     """Returns total fiber channel insertion loss in dB for a given distance, using a flat attenuation model."""
     return attenuation_db_per_km * distance_m / 1000 + connection_loss_db
 
-def fiber_dispersion_ps_per_nm(distance_m, wavelength_nm=1310.0, lambda0_nm=1300.0, S0_ps_per_nm2_per_km=0.093):
-    """Returns total chromatic dispersion D*L in ps/nm for a SMF link (IEC 60793-2-50 formula).
-
-    Args:
-        distance_m (float): Fiber length in meters.
-        wavelength_nm (float): Laser wavelength in nm (default 1310).
-        lambda0_nm (float): Zero-dispersion wavelength in nm (1300-1324 per Table 121-14; use 1300 for worst case).
-        S0_ps_per_nm2_per_km (float): Dispersion slope in ps/nm²/km (max 0.093 per Table 121-14).
-
-    Returns:
-        float: Total dispersion D*L in ps/nm. Bounded by -0.93 to +0.8 ps/nm for 200GBASE-DR4 (Table 121-13).
-    """
-    D = (S0_ps_per_nm2_per_km / 4) * (wavelength_nm - lambda0_nm**4 / wavelength_nm**3)
-    return D * distance_m / 1000
 
 def channel_filter(waveform, samples_per_ui, ui, loss_db=0.0, dispersion_ps_per_nm=0.0, wavelength_nm=1310.0):
     """Applies fiber channel: flat attenuation and chromatic dispersion.
@@ -660,7 +645,7 @@ def plot_tdecq(result, samples_per_ui, ui, save_path='tdecq.png'):
     eye  = result['eye']
     ui_ps = ui * 1e12
 
-    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(8, 4))
 
     # --- Panel 1: Eye diagram as 2D density ---
     ax1 = axes[0]
@@ -681,7 +666,7 @@ def plot_tdecq(result, samples_per_ui, ui, save_path='tdecq.png'):
     for phase_frac, label in [(0.45, '0.45 UI'), (0.55, '0.55 UI')]:
         ax1.axvline(phase_frac * ui_ps, color='grey', lw=1, ls=':', alpha=0.7)
         ax1.text(phase_frac * ui_ps, 0.97, label, transform=ax1.get_xaxis_transform(),
-                 va='top', ha='center', fontsize=9, color='grey')
+                 va='top', ha='center', fontsize=9, color='grey', rotation=90)
     ax1.set_ylim(bottom=0)
     ax1.set_xlabel('Time (ps)')
     ax1.set_ylabel('Power (mW)')
@@ -698,7 +683,7 @@ def plot_tdecq(result, samples_per_ui, ui, save_path='tdecq.png'):
     for i, pth in enumerate([p_th1, p_th2, p_th3]):
         kernel = np.exp(-0.5 * ((y_bins - pth) / sigma_eff) ** 2)
         ax2.plot(kernel * scale, y_bins, 'k--', lw=0.8, alpha=0.6,
-                 label=f'Gaussian kernel ($C_{{eq}}\\sigma_G$={sigma_eff*1e3:.1f} mW)' if i == 0 else '_nolegend_')
+                 label=f'Gaussian kernel' if i == 0 else '_nolegend_')
         ax2.axhline(pth, color='red', lw=0.8, ls='--', alpha=0.4,
                     label='Decision thresholds' if i == 0 else '_nolegend_')
     ax2.set_ylim(ax1.get_ylim())
@@ -711,169 +696,3 @@ def plot_tdecq(result, samples_per_ui, ui, save_path='tdecq.png'):
     plt.savefig(save_path, dpi=150)
     plt.show()
     print(f"Saved {save_path}")
-
-
-#%% Demo: 50-symbol pipeline
-
-
-# Generating test patterns for lanes 0-3
-seeds = [0b0000010101011, 0b0011101000001, 0b1001000101100, 0b0100010000010]  # Different seeds for each lane
-test_patterns = []
-for seed in seeds:
-    prbs_bits = prbs_sequence(register_size=13, seed=seed)  # Generate full PRBS-13 sequence (8191 bits)
-    prbs_bits += prbs_bits  # Duplicate the sequence to ensure even length for pairing
-    gray_pairs = gray_code_pairs(prbs_bits)  # Pair and Gray-code the bits
-    test_patterns.append(gray_pairs)
-
-print("Generated PAM4 test patterns for lanes 0-3 (first 20 symbols of each lane):")
-for lane, pattern in enumerate(test_patterns):
-    print(f"Lane {lane}: {pattern[:20]}")
-
-symbol_rate = 26.5625e9 # 26.5625 GBd for 200GBASE-DR4
-ui = 1 / symbol_rate
-samples_per_ui = 100
-transition_time = 10e-12
-n_symbols = 50
-tx_power_levels = [0.333, 0.667, 1.0, 1.333]
-n_taps = 5
-lane = 3
-# Approximate C_eq * sigma_G from TDECQ (hardcoded near the found value of ~0.018).
-# Used to show the noise-limited waveform in the RX panel before TDECQ is computed.
-noise_sigma = 0.02
-
-tx_pattern = test_patterns[lane][:n_symbols + n_taps + 3]
-power = symbol_to_power(tx_pattern)
-upsampled = upsample(power, samples_per_ui)
-tx = tx_filter(upsampled, samples_per_ui, transition_time, ui)
-loss_db, disp = fiber_loss_db(500), fiber_dispersion_ps_per_nm(500)
-rx = channel_filter(tx, samples_per_ui, ui, loss_db=loss_db, dispersion_ps_per_nm=disp)
-oe = rx_filter(rx, samples_per_ui, symbol_rate)
-ffe_out, tap_w = ffe(oe, samples_per_ui, n_taps)
-
-t = np.arange(n_symbols * samples_per_ui) * (ui / samples_per_ui) * 1e12  # ps
-n_plot = n_symbols * samples_per_ui
-ui_ps = ui * 1e12
-
-rx_power_levels = [p * 10 ** (-loss_db / 10) for p in tx_power_levels]
-
-n_ffe_plot = min(len(ffe_out), n_symbols - n_taps + 1) # Number of FFE output points to plot
-rx_decisions = rx_threshold(ffe_out[:n_ffe_plot], rx_power_levels)
-
-# Align the FFE output with the transmitted symbols by finding the offset that minimizes symbol errors
-
-tx_syms = np.array(tx_pattern)
-
-cursor = min(range(n_taps + 3),
-             key=lambda d: np.sum(rx_decisions != tx_syms[d:d + n_ffe_plot]))
-
-t_ffe = np.array([(i + cursor + 0.5) * ui_ps for i in range(n_ffe_plot)])
-tx_syms_aligned = tx_syms[cursor:cursor + n_ffe_plot]
-errors = np.where(rx_decisions != tx_syms_aligned)[0]
-t_sym_tx = np.arange(n_symbols) * ui_ps
-t_sym_rx = np.arange(n_ffe_plot) * ui_ps + cursor * ui_ps
-
-# Set up a 3-panel plot: TX waveforms, RX waveforms, and TX vs RX symbol decisions
-
-fig, axes = plt.subplots(3, 1, figsize=(14, 9), sharex=True,
-                         gridspec_kw={'height_ratios': [2, 2, 1]})
-
-for ax in axes:
-    for k in range(n_symbols):
-        if k % 2 == 0:
-            ax.axvspan(k * ui_ps, (k + 1) * ui_ps, color='gray', alpha=0.15, lw=0)
-
-# Panel 1: TX waveforms
-ax1 = axes[0]
-ax1.plot(t, upsampled[:n_plot], lw=0.8, label='Rectangular')
-ax1.plot(t, tx[:n_plot], lw=0.8, label=f'After TX filter ({transition_time*1e12:.0f} ps rise time)')
-for i, p in enumerate(tx_power_levels):
-    ax1.axhline(p, color='red', lw=0.5, ls='--', alpha=0.5,
-                label='TX power levels' if i == 0 else '_nolegend_')
-ax1.set_ylim(bottom=0)
-ax1.set_ylabel('Power (mW)')
-ax1.set_title('TX waveforms')
-ax1.legend(loc='upper right', fontsize=8)
-
-# Panel 2: RX waveforms
-ax2 = axes[1]
-ax2.plot(t, rx[:n_plot], lw=0.8, label=f'After channel ({loss_db:.2f} dB, {disp:.3f} ps/nm)')
-ax2.plot(t, oe[:n_plot], lw=0.8, label='After RX filter (Bessel-Thomson)')
-ax2.scatter(t_ffe, ffe_out[:n_ffe_plot], s=12, zorder=5, label='After FFE (center tap)')
-rng = np.random.default_rng(42)
-ffe_noisy = ffe_out[:n_ffe_plot] + rng.normal(0, noise_sigma, n_ffe_plot)
-ax2.scatter(t_ffe, ffe_noisy, s=6, zorder=4, alpha=0.5, label=f'FFE + noise (σ={noise_sigma*1e3:.0f} mW)')
-for i, p in enumerate(rx_power_levels):
-    ax2.axhline(p, color='blue', lw=0.5, ls='--', alpha=0.5,
-                label='RX power levels' if i == 0 else '_nolegend_')
-ax2.set_ylim(bottom=0)
-ax2.set_ylabel('Power (mW)')
-ax2.set_title('RX waveforms')
-ax2.legend(loc='upper right', fontsize=8)
-
-# Panel 3: TX vs RX symbols
-ax3 = axes[2]
-ax3.step(t_sym_tx, tx_syms[:n_symbols], where='post', lw=1.2, label='TX symbols')
-ax3.step(t_sym_rx, rx_decisions, where='post', lw=1.2, ls='--', label='RX decisions')
-if len(errors) > 0:
-    t_err = t_sym_rx[errors] + 0.5 * ui_ps
-    ax3.scatter(t_err, rx_decisions[errors], marker='x', color='red', s=40, zorder=5,
-                label=f'Errors ({len(errors)})')
-ax3.set_yticks([0, 1, 2, 3])
-ax3.set_ylabel('Symbol')
-ax3.set_xlabel('Time (ps)')
-ax3.set_title('TX vs RX symbol decisions')
-ax3.legend(loc='upper right', fontsize=8)
-
-plt.tight_layout()
-plt.savefig('waveforms.png', dpi=150)
-plt.show()
-
-#%% Demo: full TDECQ on PRBS13Q
-
-# Run the full pipeline on the complete 8191-symbol pattern for the selected lane
-tx_pattern_full = test_patterns[lane]
-power_full    = symbol_to_power(tx_pattern_full)
-upsampled_full = upsample(power_full, samples_per_ui)
-tx_full  = tx_filter(upsampled_full, samples_per_ui, transition_time, ui)
-rx_full  = channel_filter(tx_full, samples_per_ui, ui, loss_db=loss_db, dispersion_ps_per_nm=disp)
-oe_full  = rx_filter(rx_full, samples_per_ui, symbol_rate)
-
-# BT filter coefficients (needed for Ceq; matches what rx_filter uses internally)
-b_bt, a_bt = bessel(4, 0.5 * symbol_rate, btype='low', analog=False, norm='mag',
-                    fs=symbol_rate * samples_per_ui)
-
-# Align ideal levels with the FFE output: the dominant tap is at n_taps//2 (center),
-# but the waveform is already delayed by `cursor` symbols, so net offset = n_taps//2 - cursor.
-ideal_levels = np.array([rx_power_levels[s] for s in tx_pattern_full[max(0, n_taps // 2 - cursor):]])
-
-print("\nRunning TDECQ computation on full PRBS13Q pattern...")
-sym_offset = max(0, n_taps // 2 - cursor)
-tdecq_result = compute_tdecq(oe_full, ideal_levels, b_bt, a_bt, samples_per_ui, symbol_rate,
-                             tx_pattern=tx_pattern_full, sym_offset=sym_offset)
-
-print(f"TDECQ:     {tdecq_result['tdecq_db']:+.3f} dB")
-print(f"sigma_G:   {tdecq_result['sigma_g']*1e3:.4f} mW")
-print(f"C_eq:      {tdecq_result['c_eq']:.4f}")
-print(f"OMAouter:  {tdecq_result['oma_outer']*1e3:.3f} mW")
-print(f"P_ave:     {tdecq_result['p_ave']*1e3:.3f} mW")
-print(f"SER (predicted, at sigma_G): {tdecq_result['ser']:.2e}")
-print(f"Tap weights: {np.round(tdecq_result['tap_weights'], 4)}")
-
-# Actual SER: decode the equalized waveform symbol by symbol and compare to transmitted pattern.
-# The center column of the eye (phase = spu//2) gives the same samples as ffe_ls at its
-# default sample_offset, so alignment with ideal_levels (and thus tx_pattern_full) is exact.
-p_th1 = tdecq_result['p_ave'] - tdecq_result['oma_outer'] / 3
-p_th2 = tdecq_result['p_ave']
-p_th3 = tdecq_result['p_ave'] + tdecq_result['oma_outer'] / 3
-equalized_sr = tdecq_result['eye'][:, samples_per_ui // 2]
-decoded = np.where(equalized_sr >= p_th3, 3,
-          np.where(equalized_sr >= p_th2, 2,
-          np.where(equalized_sr >= p_th1, 1, 0)))
-ref_symbols = np.array(tx_pattern_full[sym_offset : sym_offset + len(decoded)])
-n_errors = int(np.sum(decoded != ref_symbols))
-print(f"SER (actual, no added noise): {n_errors / len(decoded):.2e}  ({n_errors} errors / {len(decoded)} symbols)")
-
-plot_tdecq(tdecq_result, samples_per_ui, ui)
-
-# %%
-
