@@ -182,3 +182,5 @@ n_errors = int(np.sum(decoded != ref_symbols))
 print(f"SER (actual, no added noise): {n_errors / len(decoded):.2e}  ({n_errors} errors / {len(decoded)} symbols)")
 
 plot_tdecq(tdecq_result, samples_per_ui, ui)
+
+# %%

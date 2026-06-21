@@ -1,6 +1,8 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap, PowerNorm
 from scipy.signal import lfilter, bessel, freqz
+from PIL import Image, ImageCms
 
 #%% PRBS and pattern generation
 
@@ -447,9 +449,6 @@ def collect_histograms(eye, samples_per_ui, p_ave, oma_outer, n_bins=512):
 
     Each histogram is a probability mass function F(y_i) over optical power,
     where y_i are equally spaced bin centers spanning ±2 * OMAouter around P_ave.
-    At samples_per_ui=16 the 0.04 UI window specified in the standard is smaller than
-    one sample, so each histogram is collected from the single nearest sample column.
-
     Args:
         eye (np.ndarray): Shape (n_symbols, samples_per_ui) from form_eye().
         samples_per_ui (int): Oversampling factor N.
@@ -468,8 +467,13 @@ def collect_histograms(eye, samples_per_ui, p_ave, oma_outer, n_bins=512):
     bin_edges = np.linspace(p_ave - 2 * oma_outer, p_ave + 2 * oma_outer, n_bins + 1)
     y_bins    = 0.5 * (bin_edges[:-1] + bin_edges[1:])
 
-    def _histogram(col):
-        counts, _ = np.histogram(eye[:, col], bins=bin_edges)
+    half = round(0.02 * samples_per_ui)
+
+    def _histogram(center_col):
+        lo = max(0, center_col - half)
+        hi = min(samples_per_ui, center_col + half)
+        samples = eye[:, lo:hi].ravel()
+        counts, _ = np.histogram(samples, bins=bin_edges)
         return counts / counts.sum()
 
     return y_bins, _histogram(phase_left), _histogram(phase_right)
@@ -656,18 +660,28 @@ def plot_tdecq(result, samples_per_ui, ui, save_path='tdecq.png'):
         t_eye, p_eye, bins=[samples_per_ui, 200],
         range=[[0, ui_ps], [p_eye.min(), p_eye.max()]]
     )
-    ax1.pcolormesh(t_edges, p_edges, counts.T, cmap='hot_r')
+    _hot = plt.cm.hot(np.linspace(0.0, 0.85, 256))  # stop before white so dense regions stay visible
+    _hot[:, 3] = np.linspace(0, 1, 256)
+    _cmap = LinearSegmentedColormap.from_list('hot_alpha', _hot)
+    ax1.set_facecolor('#05050f')
+    ax1.pcolormesh(t_edges, p_edges, counts.T, cmap=_cmap,
+                   norm=PowerNorm(gamma=0.2, vmin=0, vmax=counts.max()),
+                   shading='auto')
     # Horizontal threshold lines with inline labels on the left edge
-    for p, label in [(p_th1, '$P_{th1}$'), (p_th2, '$P_{th2}=P_{ave}$'), (p_th3, '$P_{th3}$')]:
-        ax1.axhline(p, color='grey', lw=0.8, ls='--', alpha=0.7)
+    for p, label in [(p_th1, r'$P_{th1} = P_{ave} - \mathrm{OMA}/3$'),
+                     (p_th2, r'$P_{th2} = P_{ave}$'),
+                     (p_th3, r'$P_{th3} = P_{ave} + \mathrm{OMA}/3$')]:
+        ax1.axhline(p, color='white', lw=0.8, ls='--', alpha=0.7)
         ax1.text(0.01, p, label, transform=ax1.get_yaxis_transform(),
-                 va='bottom', ha='left', fontsize=9, color='grey')
-    # Vertical histogram window lines with inline labels inside the top of the plot
+                 va='bottom', ha='left', fontsize=9, color='white')
+    # Vertical histogram windows as shaded bands (0.04 UI wide per 121.8.5.3)
+    half_win = 0.02 * ui_ps
     for phase_frac, label in [(0.45, '0.45 UI'), (0.55, '0.55 UI')]:
-        ax1.axvline(phase_frac * ui_ps, color='grey', lw=1, ls=':', alpha=0.7)
-        ax1.text(phase_frac * ui_ps, 0.97, label, transform=ax1.get_xaxis_transform(),
-                 va='top', ha='center', fontsize=9, color='grey', rotation=90)
-    ax1.set_ylim(bottom=0)
+        cx = phase_frac * ui_ps
+        ax1.axvspan(cx - half_win, cx + half_win, color='white', alpha=0.15)
+        ax1.text(cx, 0.97, label, transform=ax1.get_xaxis_transform(),
+                 va='top', ha='center', fontsize=9, color='white', rotation=90)
+    ax1.set_ylim(bottom=0, top=p_eye.max() + 0.1)
     ax1.set_xlabel('Time (ps)')
     ax1.set_ylabel('Power (mW)')
     ax1.set_title('Equalized eye diagram')
@@ -695,4 +709,7 @@ def plot_tdecq(result, samples_per_ui, ui, save_path='tdecq.png'):
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
     plt.show()
+    srgb = ImageCms.createProfile('sRGB')
+    img = Image.open(save_path)
+    img.save(save_path, icc_profile=ImageCms.ImageCmsProfile(srgb).tobytes())
     print(f"Saved {save_path}")
